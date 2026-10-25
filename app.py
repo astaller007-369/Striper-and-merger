@@ -143,7 +143,8 @@ direction = st.radio(
 )
 src, dst = (0, 1) if direction == "CSV 1 → CSV 2" else (1, 0)
 st.caption(f"Empty stat cells in **CSV {dst + 1}** will be filled from **CSV {src + 1}**. "
-           f"The output is CSV {dst + 1} with its own columns and rows; nothing else is changed.")
+           f"The output is CSV {dst + 1} with its own columns and rows, plus any essential columns it "
+           "was missing. Nothing else is changed.")
 
 # ---------- column mapping ----------
 st.subheader("Stat columns to copy")
@@ -183,6 +184,13 @@ non_stat = st.multiselect(
     default=[c for c in NON_STAT_DEFAULT if c in all_canon],
     help="Add any other descriptive column here (e.g. venue, referee, round).",
 )
+essential = st.multiselect(
+    "Essential columns (added to the destination if it doesn't have them)",
+    COLS,
+    default=[c for c in COLS if canon(c) not in set(non_stat)],
+    help="Any of these missing from the destination file is added as a new column and filled "
+         "from the source file. Other source-only columns are NOT added.",
+)
 overwrite = st.checkbox("Overwrite existing percentage values with recalculated ones")
 
 # ---------- run ----------
@@ -204,15 +212,28 @@ if st.button("Copy stats, calculate & build final CSV", type="primary"):
         s_index.setdefault(key(r, keys[src]), r)
 
     dst_col = {canon(c): c for c in dfs[dst].columns}
+    src_col = {canon(c): c for c in dfs[src].columns}
+
+    # essential columns the destination lacks -> appended (in COLS order), nothing else is added
+    add_cols = [c for c in essential if canon(c) not in dst_col and canon(c) not in excluded]
+    for c in add_cols:
+        dst_col[canon(c)] = c
     matched = unmatched = filled = calc = 0
 
     for rd in D:
+        for c in add_cols:
+            rd[c] = ""
         rs = s_index.get(key(rd, keys[dst]))
         if rs is not None:
             matched += 1
             for s, d in pairs:
                 if empty(rd[d]) and not empty(rs[s]):
                     rd[d] = rs[s]
+                    filled += 1
+            for c in add_cols:
+                sc = src_col.get(canon(c))
+                if sc is not None and not empty(rs[sc]):
+                    rd[c] = rs[sc]
                     filled += 1
         else:
             unmatched += 1
@@ -245,14 +266,16 @@ if st.button("Copy stats, calculate & build final CSV", type="primary"):
                 put(f"home_{t}_duels_percentage", math.floor(h / (h + a) * 100 + 0.5))
                 put(f"away_{t}_duels_percentage", math.floor(a / (h + a) * 100 + 0.5))
 
-    out = pd.DataFrame(D, columns=list(dfs[dst].columns)).fillna("")
-    st.session_state["result"] = (out, matched, unmatched, filled, calc, src + 1, dst + 1)
+    out = pd.DataFrame(D, columns=list(dfs[dst].columns) + add_cols).fillna("")
+    st.session_state["result"] = (out, matched, unmatched, filled, calc, src + 1, dst + 1, add_cols)
 
 if "result" in st.session_state:
-    out, matched, unmatched, filled, calc, s_no, d_no = st.session_state["result"]
+    out, matched, unmatched, filled, calc, s_no, d_no, added = st.session_state["result"]
     st.success(f"{len(out)} rows (CSV {d_no}) · {matched} matched in CSV {s_no} · "
                f"{unmatched} with no match · {filled} stat cells copied · "
-               f"{calc} percentages calculated.")
+               f"{calc} percentages calculated · {len(added)} essential columns added.")
+    if added:
+        st.caption("Added columns: " + ", ".join(added))
     blanks = {c: int((out[c] == "").sum()) for c in out.columns if (out[c] == "").any()}
     if blanks:
         st.caption("Columns still containing empty cells: "
