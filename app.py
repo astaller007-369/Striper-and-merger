@@ -1,3 +1,4 @@
+import io
 import math
 import re
 
@@ -5,6 +6,9 @@ import pandas as pd
 import streamlit as st
 
 COLS = "league_country,season,date,home_team,away_team,home_goals,away_goals,home_shots_on_target,away_shots_on_target,home_big_chances,away_big_chances,home_box_touches,away_box_touches,home_corner_kicks,away_corner_kicks,home_fouled_in_final_third,away_fouled_in_final_third,home_accurate_crosses,away_accurate_crosses,home_successful_crosses_percentage,away_successful_crosses_percentage,home_accurate_long_balls,away_accurate_long_balls,home_successful_long_passes_percentage,away_successful_long_passes_percentage,home_final_third_entries,away_final_third_entries,home_dribbles_percentage,away_dribbles_percentage,home_tackles_won_percentage,away_tackles_won_percentage,home_ground_duels_percentage,away_ground_duels_percentage,home_aerial_duels_percentage,away_aerial_duels_percentage,home_goalkeeper_saves,away_goalkeeper_saves,home_xg,away_xg,home_xgot,away_xgot,home_xg_set_play,away_xg_set_play,home_xg_open_play,away_xg_open_play".split(",")
+
+# Columns that identify a match or describe it (not stat metrics). Never copied.
+NON_STAT_DEFAULT = ["league_country", "season", "date", "home_team", "away_team"]
 
 
 # ---------- helpers ----------
@@ -67,11 +71,28 @@ def pct(n, d):
 
 @st.cache_data(show_spinner=False)
 def load(file_bytes):
-    import io
-    df = pd.read_csv(io.BytesIO(file_bytes), dtype=str, keep_default_na=False)
+    """Returns (dataframe, number of malformed lines that had to be skipped)."""
+    for enc in ("utf-8-sig", "latin-1"):
+        try:
+            text = file_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+
+    bad = []
+    try:
+        df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False)
+    except pd.errors.ParserError:
+        # tolerant fallback: sniff delimiter, skip (and count) malformed lines
+        bad.clear()
+        df = pd.read_csv(
+            io.StringIO(text), sep=None, engine="python", dtype=str,
+            keep_default_na=False, skipinitialspace=True,
+            on_bad_lines=lambda row: bad.append(row),  # returns None -> line skipped
+        )
     for c in df.columns:
         df[c] = df[c].map(lambda v, c=c: rnd(c, v))
-    return df
+    return df, len(bad)
 
 
 def detect(df, name):
@@ -84,8 +105,8 @@ def detect(df, name):
 # ---------- UI ----------
 st.set_page_config(page_title="CSV Match Merger", page_icon="⚽", layout="wide")
 st.title("⚽ CSV Match Merger")
-st.caption("Upload two CSVs, cross-fill empty cells by date + home team + away team, "
-           "calculate percentages and export one clean CSV.")
+st.caption("Upload two CSVs, copy missing stat metrics one way (matched by date + home team + "
+           "away team), calculate percentages and export the result.")
 
 c1, c2 = st.columns(2)
 files, dfs, keys = [None, None], [None, None], [None, None]
@@ -94,9 +115,12 @@ for i, col in enumerate((c1, c2)):
         st.subheader(f"CSV {i + 1}")
         files[i] = st.file_uploader("Upload CSV", type="csv", key=f"f{i}")
         if files[i]:
-            dfs[i] = load(files[i].getvalue())
+            dfs[i], nbad = load(files[i].getvalue())
             st.caption(f"{len(dfs[i])} rows · {len(dfs[i].columns)} columns "
                        "(decimals stripped except xG family)")
+            if nbad:
+                st.warning(f"{nbad} malformed line(s) in this file were skipped. Matches on those "
+                           "lines will be missing - fix the source file if that matters.")
             k1, k2, k3 = st.columns(3)
             cols = list(dfs[i].columns)
             keys[i] = [
@@ -109,8 +133,20 @@ if not all(d is not None for d in dfs):
     st.info("Upload both CSV files to continue.")
     st.stop()
 
+# ---------- direction ----------
+st.subheader("Copy direction")
+direction = st.radio(
+    "Copy stat metrics from → to",
+    ["CSV 1 → CSV 2", "CSV 2 → CSV 1"],
+    horizontal=True,
+    help="Only empty cells in the destination file are filled. The source file is never changed.",
+)
+src, dst = (0, 1) if direction == "CSV 1 → CSV 2" else (1, 0)
+st.caption(f"Empty stat cells in **CSV {dst + 1}** will be filled from **CSV {src + 1}**. "
+           f"The output is CSV {dst + 1} with its own columns and rows; nothing else is changed.")
+
 # ---------- column mapping ----------
-st.subheader("Matching columns (copied both ways)")
+st.subheader("Stat columns to copy")
 kc = {canon(c) for k in keys for c in k}
 auto = []
 for a in dfs[0].columns:
@@ -139,81 +175,87 @@ mapping = st.data_editor(
         "CSV 2 column": st.column_config.SelectboxColumn(options=list(dfs[1].columns)),
     },
 )
+
+all_canon = sorted({canon(c) for d in dfs for c in d.columns})
+non_stat = st.multiselect(
+    "Non-stat columns (never copied, left exactly as they are)",
+    all_canon,
+    default=[c for c in NON_STAT_DEFAULT if c in all_canon],
+    help="Add any other descriptive column here (e.g. venue, referee, round).",
+)
 overwrite = st.checkbox("Overwrite existing percentage values with recalculated ones")
 
 # ---------- run ----------
-if st.button("Merge, calculate & build final CSV", type="primary"):
-    A = dfs[0].to_dict("records")
-    B = dfs[1].to_dict("records")
-    b_index = {}
-    for r in B:
-        b_index.setdefault(key(r, keys[1]), r)
+if st.button("Copy stats, calculate & build final CSV", type="primary"):
+    excluded = set(non_stat) | kc
+    S = dfs[src].to_dict("records")
+    D = dfs[dst].to_dict("records")
+    src_name, dst_name = ("CSV 1 column", "CSV 2 column") if src == 0 else ("CSV 2 column", "CSV 1 column")
 
-    pairs = [(a, b) for a, b in zip(mapping["CSV 1 column"], mapping["CSV 2 column"])
-             if a in dfs[0].columns and b in dfs[1].columns]
-    matched = filled = 0
-    seen = set()
-    for ra in A:
-        k = key(ra, keys[0])
-        rb = b_index.get(k)
-        if rb is None:
-            continue
-        if k not in seen:
-            seen.add(k)
+    # (source column, destination column) pairs - stat metrics only
+    pairs = [
+        (s, d) for s, d in zip(mapping[src_name], mapping[dst_name])
+        if s in dfs[src].columns and d in dfs[dst].columns
+        and canon(d) not in excluded and canon(s) not in excluded
+    ]
+
+    s_index = {}
+    for r in S:
+        s_index.setdefault(key(r, keys[src]), r)
+
+    dst_col = {canon(c): c for c in dfs[dst].columns}
+    matched = unmatched = filled = calc = 0
+
+    for rd in D:
+        rs = s_index.get(key(rd, keys[dst]))
+        if rs is not None:
             matched += 1
-        for a, b in pairs:
-            if empty(ra[a]) and not empty(rb[b]):
-                ra[a] = rb[b]; filled += 1
-            elif empty(rb[b]) and not empty(ra[a]):
-                rb[b] = ra[a]; filled += 1
+            for s, d in pairs:
+                if empty(rd[d]) and not empty(rs[s]):
+                    rd[d] = rs[s]
+                    filled += 1
+        else:
+            unmatched += 1
 
-    # merge both files into one canonical-named row per match
-    merged, order = {}, []
+        # canonical view used only to calculate percentages (inputs may come from either file)
+        m = {canon(c): v for c, v in rd.items() if not empty(v)}
+        if rs is not None:
+            for c, v in rs.items():
+                if canon(c) not in excluded and canon(c) not in m and not empty(v):
+                    m[canon(c)] = v
 
-    def add(r, k, kk, fields):
-        m = merged.get(k)
-        if m is None:
-            m = merged[k] = {}
-            order.append(k)
-        for c in fields:
-            cc = canon(c)
-            if empty(m.get(cc)) and not empty(r[c]):
-                m[cc] = r[c]
-        for name, col in zip(("date", "home_team", "away_team"), kk):
-            if empty(m.get(name)):
-                m[name] = r[col]
+        def put(c, v):
+            """Write a calculated percentage into the destination row (if it has that column)."""
+            global calc
+            col = dst_col.get(c)
+            if v is None or col is None:
+                return
+            if overwrite or empty(rd[col]):
+                new = str(v)
+                if rd[col] != new:
+                    rd[col] = new
+                    calc += 1
 
-    for r in A:
-        add(r, key(r, keys[0]), keys[0], dfs[0].columns)
-    for r in B:
-        add(r, key(r, keys[1]), keys[1], dfs[1].columns)
-
-    def put(m, c, v):
-        if v is not None and (overwrite or empty(m.get(c))):
-            m[c] = v
-
-    for k in order:
-        m = merged[k]
-        for s in ("home", "away"):
-            put(m, f"{s}_tackles_won_percentage", pct(num(m, f"{s}_tackles_won"), num(m, f"{s}_total_tackles")))
-            put(m, f"{s}_successful_crosses_percentage", pct(num(m, f"{s}_accurate_crosses"), num(m, f"{s}_total_crosses")))
+        for s_ in ("home", "away"):
+            put(f"{s_}_tackles_won_percentage", pct(num(m, f"{s_}_tackles_won"), num(m, f"{s_}_total_tackles")))
+            put(f"{s_}_successful_crosses_percentage", pct(num(m, f"{s_}_accurate_crosses"), num(m, f"{s_}_total_crosses")))
         for t in ("ground", "aerial"):
             h, a = num(m, f"home_{t}_duels_won"), num(m, f"away_{t}_duels_won")
             if h is not None and a is not None and h + a > 0:
-                put(m, f"home_{t}_duels_percentage", math.floor(h / (h + a) * 100 + 0.5))
-                put(m, f"away_{t}_duels_percentage", math.floor(a / (h + a) * 100 + 0.5))
+                put(f"home_{t}_duels_percentage", math.floor(h / (h + a) * 100 + 0.5))
+                put(f"away_{t}_duels_percentage", math.floor(a / (h + a) * 100 + 0.5))
 
-    out = pd.DataFrame([[rnd(c, str(merged[k].get(canon(c), ""))) for c in COLS] for k in order],
-                       columns=COLS)
-    st.session_state["result"] = (out, matched, filled)
+    out = pd.DataFrame(D, columns=list(dfs[dst].columns)).fillna("")
+    st.session_state["result"] = (out, matched, unmatched, filled, calc, src + 1, dst + 1)
 
 if "result" in st.session_state:
-    out, matched, filled = st.session_state["result"]
-    st.success(f"{len(out)} rows in final CSV · {matched} matches found · "
-               f"{filled} empty cells filled across the two files.")
-    blanks = {c: int((out[c] == "").sum()) for c in COLS if (out[c] == "").any()}
+    out, matched, unmatched, filled, calc, s_no, d_no = st.session_state["result"]
+    st.success(f"{len(out)} rows (CSV {d_no}) · {matched} matched in CSV {s_no} · "
+               f"{unmatched} with no match · {filled} stat cells copied · "
+               f"{calc} percentages calculated.")
+    blanks = {c: int((out[c] == "").sum()) for c in out.columns if (out[c] == "").any()}
     if blanks:
-        st.caption("Columns still containing empty cells (no source data found): "
+        st.caption("Columns still containing empty cells: "
                    + ", ".join(f"{c} ({n})" for c, n in blanks.items()))
     st.download_button("⬇️ Download final CSV", out.to_csv(index=False).encode("utf-8"),
                        "final_matches.csv", "text/csv", type="primary")
